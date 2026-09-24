@@ -14,17 +14,19 @@
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs"
 import { createSign } from "node:crypto"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 
 const DIR = fileURLToPath(new URL(".", import.meta.url))
 const ENV_PATH = DIR + ".env"
 const CONFIG_PATH = DIR + "config.json"
 
-// ---- .env 読み込み（値の引用符は剥がす） ----
-const env = {}
-for (const line of readFileSync(ENV_PATH, "utf8").split("\n")) {
-  const m = line.match(/^([A-Z0-9_]+)=(.*)$/)
-  if (m) env[m[1]] = m[2].replace(/^"|"$/g, "")
+// ---- 設定読み込み: ローカルは .env、Vercel等では process.env（.env が優先） ----
+const env = { ...process.env }
+if (existsSync(ENV_PATH)) {
+  for (const line of readFileSync(ENV_PATH, "utf8").split("\n")) {
+    const m = line.match(/^([A-Z0-9_]+)=(.*)$/)
+    if (m) env[m[1]] = m[2].replace(/^"|"$/g, "")
+  }
 }
 const need = (k) => {
   if (!env[k]) throw new Error(`${k} が .env に未設定です`)
@@ -112,6 +114,9 @@ async function gapi(url, method = "GET", body) {
 
 // ---- スプレッドシート準備（初回のみ作成して共有、config.json にターゲット別で保存） ----
 async function ensureSpreadsheet(targetKey) {
+  // Vercel等ではファイルに保存できないので、env（SPREADSHEET_ID_BOX 等）でIDを渡す
+  const envId = env[`SPREADSHEET_ID_${targetKey.toUpperCase()}`]
+  if (envId) return envId
   let config = existsSync(CONFIG_PATH) ? JSON.parse(readFileSync(CONFIG_PATH, "utf8")) : {}
   // 旧形式（トップレベルに spreadsheetId）は box のものとして移行する
   if (config.spreadsheetId) config = { box: config }
@@ -350,33 +355,40 @@ async function sync(targetKey, detailDates) {
   await reorderTabs(spreadsheetId, [...detailDates.flatMap((d) => [d, `${d} 時間別`]), allTab])
 }
 
-// ---- エントリポイント ----
-const args = process.argv.slice(2)
-const target = args.find((a) => !a.startsWith("--")) || "box"
-if (!TARGETS[target]) {
-  console.error(`不明なターゲット: ${target}（指定可能: ${Object.keys(TARGETS).join(", ")}）`)
-  process.exit(1)
-}
-const dateArg = args.find((a) => a.startsWith("--date="))?.slice(7)
 const jstDate = (offsetDays = 0) =>
   new Date(Date.now() + offsetDays * 86400000).toLocaleDateString("sv-SE", { timeZone: "Asia/Tokyo" }) // YYYY-MM-DD
-const watch = args.includes("--watch")
-const intervalMin = Number(args.find((a) => a.startsWith("--interval="))?.slice(11)) || 10
 
-// --date 指定時はその日だけ、通常は今日＋翌日の明細と全日程の時間別を同期
-const syncAll = () => sync(target, dateArg ? [dateArg] : [jstDate(0), jstDate(1)])
+// 今日＋翌日の明細と全日程の時間別を同期（Vercelのcronからも使う）
+export const syncTarget = (targetKey, dates = [jstDate(0), jstDate(1)]) => sync(targetKey, dates)
+export const targetKeys = Object.keys(TARGETS)
 
-if (watch) {
-  const loop = async () => {
-    try {
-      await syncAll()
-    } catch (e) {
-      console.error("同期エラー:", e.message)
-    }
-    setTimeout(loop, intervalMin * 60 * 1000)
+// ---- CLIエントリポイント（importされたときは実行しない） ----
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const args = process.argv.slice(2)
+  const target = args.find((a) => !a.startsWith("--")) || "box"
+  if (!TARGETS[target]) {
+    console.error(`不明なターゲット: ${target}（指定可能: ${Object.keys(TARGETS).join(", ")}）`)
+    process.exit(1)
   }
-  console.log(`[${target}] ${intervalMin}分おきに同期します（Ctrl+Cで停止）`)
-  loop()
-} else {
-  await syncAll()
+  const dateArg = args.find((a) => a.startsWith("--date="))?.slice(7)
+  const watch = args.includes("--watch")
+  const intervalMin = Number(args.find((a) => a.startsWith("--interval="))?.slice(11)) || 10
+
+  // --date 指定時はその日だけ、通常は今日＋翌日の明細と全日程の時間別を同期
+  const syncAll = () => syncTarget(target, dateArg ? [dateArg] : undefined)
+
+  if (watch) {
+    const loop = async () => {
+      try {
+        await syncAll()
+      } catch (e) {
+        console.error("同期エラー:", e.message)
+      }
+      setTimeout(loop, intervalMin * 60 * 1000)
+    }
+    console.log(`[${target}] ${intervalMin}分おきに同期します（Ctrl+Cで停止）`)
+    loop()
+  } else {
+    await syncAll()
+  }
 }
