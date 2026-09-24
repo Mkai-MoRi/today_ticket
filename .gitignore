@@ -1,0 +1,6 @@
+# 秘匿情報・ローカル状態はコミットしない
+.env
+config.json
+report-state.json
+*.log
+.claude/
