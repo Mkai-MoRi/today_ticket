@@ -355,7 +355,9 @@ async function notifySameDayPurchases(spreadsheetId, notify, date, tickets) {
 // 1人1行（予約番号・氏名(ニックネーム)・組分け・受付確認/誓約書回収チェックボックス・備考）。
 // 既存タブへは未記載の予約番号だけを末尾に追記し、現場で入力済みのチェックや組分けは触らない。
 const RC_GRAY = { red: 0.9529412, green: 0.9529412, blue: 0.9529412 }
-const RC_WIDTHS = [74, 137, 115, 93, 93, 242]
+// 列: No. / 予約番号 / 氏名 / 組分け / 受付確認 / 誓約書回収 / 備考
+const RC_WIDTHS = [40, 74, 137, 115, 93, 93, 242]
+const RC_COLS = RC_WIDTHS.length
 
 // 自由回答のニックネームを人数分に分割する。書き方のゆらぎに段階的に対応:
 //   区切り文字（、,・/など）→ 足りなければ「」括り → さらに足りなければスペース区切り。
@@ -386,19 +388,27 @@ export function splitNames(nickname, quantity) {
 }
 
 const rcCell = (value, format = {}) => ({
-  userEnteredValue: typeof value === "boolean" ? { boolValue: value } : { stringValue: String(value) },
+  userEnteredValue:
+    typeof value === "boolean"
+      ? { boolValue: value }
+      : typeof value === "number"
+        ? { numberValue: value }
+        : { stringValue: String(value) },
   userEnteredFormat: format,
 })
 
 // absIdx は0始まりの行番号。4行目(absIdx=3)が白、以降交互に灰色（既存タブの縞に合わせる）
+// 先頭列は表の上から 1,2,… の通し番号（absIdx-2 で計算し、追記時も続きの番号になる）
 function receptionPersonRows(tickets, startIdx) {
   const rows = []
   for (const t of tickets) {
     splitNames(t.nickname, t.quantity).forEach((name, i) => {
-      const bg = (startIdx + rows.length) % 2 === 0 ? { backgroundColor: RC_GRAY } : {}
+      const absIdx = startIdx + rows.length
+      const bg = absIdx % 2 === 0 ? { backgroundColor: RC_GRAY } : {}
       const center = { horizontalAlignment: "CENTER", ...bg }
       rows.push({
         values: [
+          rcCell(absIdx - 2, center),
           rcCell(t.ticketCode, center),
           rcCell(name, { ...center, textFormat: { fontSize: 14 } }),
           rcCell("", bg),
@@ -427,7 +437,7 @@ const rcRowHeight = (sheetId, startIndex, endIndex, pixelSize) => ({
 const RC_BORDER = { style: "SOLID", color: { red: 0, green: 0, blue: 0 } }
 const receptionBorderRequest = (sheetId, endRowIndex) => ({
   updateBorders: {
-    range: { sheetId, startRowIndex: 0, endRowIndex, startColumnIndex: 0, endColumnIndex: 6 },
+    range: { sheetId, startRowIndex: 0, endRowIndex, startColumnIndex: 0, endColumnIndex: RC_COLS },
     top: RC_BORDER,
     bottom: RC_BORDER,
     left: RC_BORDER,
@@ -448,8 +458,8 @@ function receptionRowRequests(sheetId, startIdx, tickets) {
           sheetId,
           startRowIndex: startIdx,
           endRowIndex: startIdx + rows.length,
-          startColumnIndex: 3,
-          endColumnIndex: 5,
+          startColumnIndex: 4,
+          endColumnIndex: 6,
         },
         rule: { condition: { type: "BOOLEAN" }, strict: true },
       },
@@ -494,8 +504,8 @@ async function upsertReceptionTabs(reception, slotTickets, appendDates) {
             fields: "pixelSize",
           },
         })),
-        { mergeCells: { range: { sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 6 } } },
-        { mergeCells: { range: { sheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 0, endColumnIndex: 6 } } },
+        { mergeCells: { range: { sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: RC_COLS } } },
+        { mergeCells: { range: { sheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 0, endColumnIndex: RC_COLS } } },
         {
           updateCells: {
             start: { sheetId, rowIndex: 0, columnIndex: 0 },
@@ -503,7 +513,7 @@ async function upsertReceptionTabs(reception, slotTickets, appendDates) {
             rows: [
               { values: [rcCell(reception.title, { textFormat: { bold: true, fontSize: 14 }, horizontalAlignment: "CENTER" })] },
               { values: [rcCell(dateLine, { horizontalAlignment: "CENTER" })] },
-              { values: ["予約番号", "氏名", "組分け", "受付確認", "誓約書回収", "備考"].map((v) => rcCell(v, headerFmt)) },
+              { values: ["No.", "予約番号", "氏名", "組分け", "受付確認", "誓約書回収", "備考"].map((v) => rcCell(v, headerFmt)) },
             ],
           },
         },
@@ -528,11 +538,12 @@ async function upsertReceptionTabs(reception, slotTickets, appendDates) {
     if (toCreate.some((c) => c.title === title)) continue // いま作ったばかり
     {
       const sheetId = tabs.get(title)
+      // 予約番号はB列（A列は通し番号）。行数はA1:B全体で数える
       const existing = await gapi(
-        `https://sheets.googleapis.com/v4/spreadsheets/${id}/values/${encodeURIComponent(`'${title}'!A1:A1000`)}`,
+        `https://sheets.googleapis.com/v4/spreadsheets/${id}/values/${encodeURIComponent(`'${title}'!A1:B1000`)}`,
       )
       const rows = existing.values || []
-      const seen = new Set(rows.map((r) => r[0]).filter(Boolean))
+      const seen = new Set(rows.map((r) => r[1]).filter(Boolean))
       const fresh = tickets.filter((t) => !seen.has(t.ticketCode))
       if (!fresh.length) continue
       const startIdx = rows.length // 0始まり = 最終使用行の次
