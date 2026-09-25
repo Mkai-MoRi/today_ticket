@@ -414,6 +414,20 @@ function receptionPersonRows(tickets, startIdx) {
 
 const RC_CELL_FIELDS = "userEnteredValue,userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
 
+// 表全体（A1〜F最終行）に実線の格子罫線を引く（元の受付表と同じ見た目）
+const RC_BORDER = { style: "SOLID", color: { red: 0, green: 0, blue: 0 } }
+const receptionBorderRequest = (sheetId, endRowIndex) => ({
+  updateBorders: {
+    range: { sheetId, startRowIndex: 0, endRowIndex, startColumnIndex: 0, endColumnIndex: 6 },
+    top: RC_BORDER,
+    bottom: RC_BORDER,
+    left: RC_BORDER,
+    right: RC_BORDER,
+    innerHorizontal: RC_BORDER,
+    innerVertical: RC_BORDER,
+  },
+})
+
 function receptionRowRequests(sheetId, startIdx, tickets) {
   const rows = receptionPersonRows(tickets, startIdx)
   if (!rows.length) return []
@@ -478,6 +492,7 @@ async function upsertReceptionTabs(reception, slotTickets, detailDates) {
             },
           },
           ...receptionRowRequests(sheetId, 3, tickets),
+          receptionBorderRequest(sheetId, 3 + tickets.reduce((s, t) => s + t.quantity, 0)),
         ],
       })
       console.log(`受付表タブを作成: ${title}（${tickets.length}件）`)
@@ -494,6 +509,9 @@ async function upsertReceptionTabs(reception, slotTickets, detailDates) {
       const startIdx = rows.length // 0始まり = 最終使用行の次
       const requests = receptionRowRequests(sheetId, startIdx, fresh)
       if (requests.length) {
+        requests.push(
+          receptionBorderRequest(sheetId, startIdx + fresh.reduce((s, t) => s + t.quantity, 0)),
+        )
         await gapi(`https://sheets.googleapis.com/v4/spreadsheets/${id}:batchUpdate`, "POST", { requests })
         console.log(`受付表に追記: ${title} ${fresh.length}件（${fresh.map((t) => t.ticketCode).join(", ")}）`)
       }
