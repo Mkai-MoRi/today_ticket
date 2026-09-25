@@ -54,6 +54,11 @@ const TARGETS = {
       name: "MIRAGE",
       webhook: env.SLACK_WEBHOOK_URL_MIRAGE || env.SLACK_WEBHOOK_URL,
     },
+    // 受付表スプレッドシートに公演回ごとの「受付表 M/D H時」タブを自動生成・追記する
+    reception: {
+      sheetId: env.RECEPTION_SHEET_ID_MIRAGE,
+      title: "『MIRAGE』一般公演",
+    },
   },
 }
 
@@ -261,6 +266,7 @@ async function buildData(events, detailDates) {
   const detail = Object.fromEntries(detailDates.map((d) => [d, { rows: [], checkedIn: 0 }]))
   const slotAgg = new Map() // "date time" → { date, time, count, capacity }（イベント合算）
   const sameDay = [] // 当日券 = 公演当日(fromDate)に購入された当日公演のチケット
+  const slotTickets = new Map() // detailDates分の "date time" → チケット配列（受付表用）
   for (const ev of events) {
     const slots = (await escapeGet(`/events/${ev.uid}/slots`)).items
       .filter((s) => s.startAt.slice(0, 10) >= fromDate)
@@ -276,9 +282,11 @@ async function buildData(events, detailDates) {
       agg.capacity += slot.simpleCapacity ?? (slot.tableUnitCapacity ?? 0) * (slot.tableCount ?? 0)
       slotAgg.set(key, agg)
       const d = detail[date]
+      const st = d ? slotTickets.get(key) || slotTickets.set(key, []).get(key) : null
       for (const t of ticketsBySlot[i].items) {
         if (t.revokedAt) continue
         agg.count += t.quantity
+        st?.push({ ticketCode: t.ticketCode, quantity: t.quantity, nickname: nicknameOf(t), note: t.note || "" })
         if (date === fromDate && t.createdAt.slice(0, 10) === fromDate) {
           sameDay.push({
             ticketCode: t.ticketCode,
@@ -304,7 +312,7 @@ async function buildData(events, detailDates) {
   }
   for (const d of Object.values(detail)) d.rows.sort((a, b) => a[0].localeCompare(b[0]))
   const all = [...slotAgg.values()].sort((a, b) => `${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`))
-  return { detail, all, sameDay }
+  return { detail, all, sameDay, slotTickets }
 }
 
 // ---- 当日券のSlack通知（通知済み管理はシートの専用タブ。Vercelはステートレスなため） ----
@@ -343,6 +351,137 @@ async function notifySameDayPurchases(spreadsheetId, notify, date, tickets) {
   console.log(`当日券通知: ${fresh.length}件（${fresh.map((t) => t.ticketCode).join(", ")}）`)
 }
 
+// ---- MIRAGE受付表: 公演回ごとの「受付表 M/D H時」タブを既存フォーマットで生成・追記 ----
+// 1人1行（予約番号・氏名(ニックネーム)・組分け・受付確認/誓約書回収チェックボックス・備考）。
+// 既存タブへは未記載の予約番号だけを末尾に追記し、現場で入力済みのチェックや組分けは触らない。
+const RC_GRAY = { red: 0.9529412, green: 0.9529412, blue: 0.9529412 }
+const RC_WIDTHS = [74, 137, 115, 93, 93, 242]
+
+// 自由回答のニックネームを人数分に分割（「まこ、ルネ」→ 2行）。足りなければ空欄で埋める。
+function splitNames(nickname, quantity) {
+  const parts = (nickname || "").split(/[、,，・\/／\n]+/).map((s) => s.trim()).filter(Boolean)
+  const names = parts.slice(0, quantity)
+  if (parts.length > quantity && quantity > 0) names[quantity - 1] = parts.slice(quantity - 1).join("、")
+  while (names.length < quantity) names.push("")
+  return names
+}
+
+const rcCell = (value, format = {}) => ({
+  userEnteredValue: typeof value === "boolean" ? { boolValue: value } : { stringValue: String(value) },
+  userEnteredFormat: format,
+})
+
+// absIdx は0始まりの行番号。4行目(absIdx=3)が白、以降交互に灰色（既存タブの縞に合わせる）
+function receptionPersonRows(tickets, startIdx) {
+  const rows = []
+  for (const t of tickets) {
+    splitNames(t.nickname, t.quantity).forEach((name, i) => {
+      const bg = (startIdx + rows.length) % 2 === 0 ? { backgroundColor: RC_GRAY } : {}
+      const center = { horizontalAlignment: "CENTER", ...bg }
+      rows.push({
+        values: [
+          rcCell(t.ticketCode, center),
+          rcCell(name, { ...center, textFormat: { fontSize: 14 } }),
+          rcCell("", bg),
+          rcCell(false, center),
+          rcCell(false, center),
+          rcCell(i === 0 ? t.note : "", bg),
+        ],
+      })
+    })
+  }
+  return rows
+}
+
+const RC_CELL_FIELDS = "userEnteredValue,userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
+
+function receptionRowRequests(sheetId, startIdx, tickets) {
+  const rows = receptionPersonRows(tickets, startIdx)
+  if (!rows.length) return []
+  return [
+    { updateCells: { start: { sheetId, rowIndex: startIdx, columnIndex: 0 }, fields: RC_CELL_FIELDS, rows } },
+    {
+      setDataValidation: {
+        range: {
+          sheetId,
+          startRowIndex: startIdx,
+          endRowIndex: startIdx + rows.length,
+          startColumnIndex: 3,
+          endColumnIndex: 5,
+        },
+        rule: { condition: { type: "BOOLEAN" }, strict: true },
+      },
+    },
+  ]
+}
+
+async function upsertReceptionTabs(reception, slotTickets, detailDates) {
+  const id = reception.sheetId
+  const meta = await gapi(`https://sheets.googleapis.com/v4/spreadsheets/${id}?fields=sheets.properties`)
+  const tabs = new Map(meta.sheets.map((s) => [s.properties.title, s.properties.sheetId]))
+  const keys = [...slotTickets.keys()].sort()
+  for (const key of keys) {
+    const [date, time] = key.split(" ")
+    if (!detailDates.includes(date)) continue
+    const tickets = slotTickets.get(key)
+    const title = `受付表 ${Number(date.slice(5, 7))}/${Number(date.slice(8, 10))} ${Number(time.slice(0, 2))}時`
+    if (!tabs.has(title)) {
+      // 新規タブ: フォーマットごと作成
+      const added = await gapi(`https://sheets.googleapis.com/v4/spreadsheets/${id}:batchUpdate`, "POST", {
+        requests: [{ addSheet: { properties: { title } } }],
+      })
+      const sheetId = added.replies[0].addSheet.properties.sheetId
+      tabs.set(title, sheetId)
+      const [h, m] = time.split(":").map(Number)
+      const open = `${String(Math.floor((h * 60 + m - 30) / 60)).padStart(2, "0")}:${String((h * 60 + m - 30) % 60).padStart(2, "0")}`
+      const dateLine = `　${Number(date.slice(5, 7))}月${Number(date.slice(8, 10))}日(${WEEKDAYS[new Date(date + "T00:00:00+09:00").getDay()]}) 開場${open}　開演${time}`
+      const headerFmt = { textFormat: { bold: true }, horizontalAlignment: "CENTER" }
+      await gapi(`https://sheets.googleapis.com/v4/spreadsheets/${id}:batchUpdate`, "POST", {
+        requests: [
+          ...RC_WIDTHS.map((pixelSize, i) => ({
+            updateDimensionProperties: {
+              range: { sheetId, dimension: "COLUMNS", startIndex: i, endIndex: i + 1 },
+              properties: { pixelSize },
+              fields: "pixelSize",
+            },
+          })),
+          { mergeCells: { range: { sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 6 } } },
+          { mergeCells: { range: { sheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 0, endColumnIndex: 6 } } },
+          {
+            updateCells: {
+              start: { sheetId, rowIndex: 0, columnIndex: 0 },
+              fields: RC_CELL_FIELDS,
+              rows: [
+                { values: [rcCell(reception.title, { textFormat: { bold: true, fontSize: 14 }, horizontalAlignment: "CENTER" })] },
+                { values: [rcCell(dateLine, { horizontalAlignment: "CENTER" })] },
+                { values: ["予約番号", "氏名", "組分け", "受付確認", "誓約書回収", "備考"].map((v) => rcCell(v, headerFmt)) },
+              ],
+            },
+          },
+          ...receptionRowRequests(sheetId, 3, tickets),
+        ],
+      })
+      console.log(`受付表タブを作成: ${title}（${tickets.length}件）`)
+    } else {
+      // 既存タブ: 未記載の予約番号だけ末尾に追記
+      const sheetId = tabs.get(title)
+      const existing = await gapi(
+        `https://sheets.googleapis.com/v4/spreadsheets/${id}/values/${encodeURIComponent(`'${title}'!A1:A1000`)}`,
+      )
+      const rows = existing.values || []
+      const seen = new Set(rows.map((r) => r[0]).filter(Boolean))
+      const fresh = tickets.filter((t) => !seen.has(t.ticketCode))
+      if (!fresh.length) continue
+      const startIdx = rows.length // 0始まり = 最終使用行の次
+      const requests = receptionRowRequests(sheetId, startIdx, fresh)
+      if (requests.length) {
+        await gapi(`https://sheets.googleapis.com/v4/spreadsheets/${id}:batchUpdate`, "POST", { requests })
+        console.log(`受付表に追記: ${title} ${fresh.length}件（${fresh.map((t) => t.ticketCode).join(", ")}）`)
+      }
+    }
+  }
+}
+
 async function writeTab(spreadsheetId, tab, clearRange, values) {
   // 古い行が残らないよう一度クリアしてから書き込む
   await gapi(
@@ -377,10 +516,13 @@ const fmtDate = (date) => `${date.slice(5)}(${WEEKDAYS[new Date(date + "T00:00:0
 
 async function sync(targetKey, detailDates) {
   const spreadsheetId = await ensureSpreadsheet(targetKey)
-  const { detail, all, sameDay } = await buildData(TARGETS[targetKey].events, detailDates)
+  const { detail, all, sameDay, slotTickets } = await buildData(TARGETS[targetKey].events, detailDates)
   const now = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" })
   if (TARGETS[targetKey].notifySameDay) {
     await notifySameDayPurchases(spreadsheetId, TARGETS[targetKey].notifySameDay, detailDates[0], sameDay)
+  }
+  if (TARGETS[targetKey].reception?.sheetId) {
+    await upsertReceptionTabs(TARGETS[targetKey].reception, slotTickets, detailDates)
   }
   // タブ順: 日付 / 日付 時間別 … / 時間別 全日程
   let tabIndex = 0
