@@ -357,9 +357,28 @@ async function notifySameDayPurchases(spreadsheetId, notify, date, tickets) {
 const RC_GRAY = { red: 0.9529412, green: 0.9529412, blue: 0.9529412 }
 const RC_WIDTHS = [74, 137, 115, 93, 93, 242]
 
-// 自由回答のニックネームを人数分に分割（「まこ、ルネ」→ 2行）。足りなければ空欄で埋める。
-function splitNames(nickname, quantity) {
-  const parts = (nickname || "").split(/[、,，・\/／\n]+/).map((s) => s.trim()).filter(Boolean)
+// 自由回答のニックネームを人数分に分割する。書き方のゆらぎに段階的に対応:
+//   区切り文字（、,・/など）→ 足りなければ「」括り → さらに足りなければスペース区切り。
+// 「1人目:しお」「1枚目…りり」「1娘：アヤちゃん」のような番号ラベルや ･ 箇条書き、「」括りは剥がす。
+// 「と」では切らない（「まこと」等の名前を壊すため）。それでも1つしか取れなければ代表者名として先頭行に入れる。
+export function splitNames(nickname, quantity) {
+  const raw = (nickname || "").trim().replace(/[。．]$/, "")
+  const clean = (s) =>
+    s
+      .trim()
+      .replace(/^[･・●○◯\-‐]\s*/, "") // 箇条書きの頭
+      .replace(/^[0-9０-９①-⑳]+[^\s：:．.、…‥]{0,6}?[：:．.、…‥]+\s*/, "") // 「1.」「2人目:」「1枚目…」「1娘：」
+      .replace(/^[「『“"]|[」』”"]$/g, "")
+      .trim()
+  let parts = raw.split(/[、,，・\/／\n;；]+/).map(clean).filter(Boolean)
+  if (parts.length < quantity) {
+    const quoted = [...raw.matchAll(/[「『]([^」』]+)[」』]/g)].map((m) => m[1].trim()).filter(Boolean)
+    if (quoted.length > parts.length) parts = quoted
+  }
+  if (parts.length < quantity) {
+    const spaced = raw.split(/[\s　]+/).map(clean).filter(Boolean)
+    if (spaced.length > parts.length) parts = spaced
+  }
   const names = parts.slice(0, quantity)
   if (parts.length > quantity && quantity > 0) names[quantity - 1] = parts.slice(quantity - 1).join("、")
   while (names.length < quantity) names.push("")
