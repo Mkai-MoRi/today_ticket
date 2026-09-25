@@ -49,6 +49,11 @@ const TARGETS = {
   mirage: {
     sheetTitle: "MIRAGE 当日チケット一覧",
     events: [{ uid: need("ESCAPE_EVENT_UID_MIRAGE"), label: "一般" }],
+    // 当日券（公演当日に購入されたチケット）をSlackへ通知する
+    notifySameDay: {
+      name: "MIRAGE",
+      webhook: env.SLACK_WEBHOOK_URL_MIRAGE || env.SLACK_WEBHOOK_URL,
+    },
   },
 }
 
@@ -147,7 +152,16 @@ async function ensureTab(spreadsheetId, title, index = 0) {
   const res = await gapi(
     `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`,
     "POST",
-    { requests: [{ addSheet: { properties: { title, index, gridProperties: { frozenRowCount: 2 } } } }] },
+    {
+      requests: [
+        {
+          addSheet: {
+            // index未指定なら末尾に追加
+            properties: { title, ...(index != null ? { index } : {}), gridProperties: { frozenRowCount: 2 } },
+          },
+        },
+      ],
+    },
   )
   return { sheetId: res.replies[0].addSheet.properties.sheetId, created: true }
 }
@@ -238,10 +252,15 @@ const hm = (iso) => iso.slice(11, 16)
 
 // detailDates（今日・翌日など）の明細行と、今日以降全日程の時間別集計を一度の取得でまとめて作る。
 // スロット・チケットのAPI呼び出しは全日程分を1回ずつで済ませ、日付別には振り分けだけ行う。
+// 購入時アンケートの自由回答からニックネームを取り出す
+const nicknameOf = (t) =>
+  t.inquiryAnswers?.find((a) => a.type === "text" && a.question?.includes("ニックネーム"))?.answer || ""
+
 async function buildData(events, detailDates) {
   const fromDate = detailDates[0]
   const detail = Object.fromEntries(detailDates.map((d) => [d, { rows: [], checkedIn: 0 }]))
   const slotAgg = new Map() // "date time" → { date, time, count, capacity }（イベント合算）
+  const sameDay = [] // 当日券 = 公演当日(fromDate)に購入された当日公演のチケット
   for (const ev of events) {
     const slots = (await escapeGet(`/events/${ev.uid}/slots`)).items
       .filter((s) => s.startAt.slice(0, 10) >= fromDate)
@@ -260,6 +279,15 @@ async function buildData(events, detailDates) {
       for (const t of ticketsBySlot[i].items) {
         if (t.revokedAt) continue
         agg.count += t.quantity
+        if (date === fromDate && t.createdAt.slice(0, 10) === fromDate) {
+          sameDay.push({
+            ticketCode: t.ticketCode,
+            quantity: t.quantity,
+            nickname: nicknameOf(t),
+            time,
+            createdAt: t.createdAt.slice(11, 16),
+          })
+        }
         if (d) {
           if (t.redeemedAt) d.checkedIn += t.quantity
           d.rows.push([
@@ -276,7 +304,43 @@ async function buildData(events, detailDates) {
   }
   for (const d of Object.values(detail)) d.rows.sort((a, b) => a[0].localeCompare(b[0]))
   const all = [...slotAgg.values()].sort((a, b) => `${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`))
-  return { detail, all }
+  return { detail, all, sameDay }
+}
+
+// ---- 当日券のSlack通知（通知済み管理はシートの専用タブ。Vercelはステートレスなため） ----
+const NOTIFIED_TAB = "通知済み当日券"
+
+async function notifySameDayPurchases(spreadsheetId, notify, date, tickets) {
+  if (!notify.webhook || !tickets.length) return
+  await ensureTab(spreadsheetId, NOTIFIED_TAB, null)
+  const existing = await gapi(
+    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(`'${NOTIFIED_TAB}'!A:A`)}`,
+  )
+  const seen = new Set((existing.values || []).flat())
+  const fresh = tickets.filter((t) => !seen.has(t.ticketCode))
+  if (!fresh.length) return
+  const lines = [
+    `🎟️ 当日券が購入されました（${notify.name} ${fmtDate(date)}）`,
+    ...fresh.map(
+      (t) =>
+        `${t.time}の回 ${t.quantity}人 / コード ${t.ticketCode} / ニックネーム: ${t.nickname || "（未記入）"}`,
+    ),
+  ]
+  const res = await fetch(notify.webhook, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: lines.join("\n") }),
+    signal: AbortSignal.timeout(TIMEOUT),
+  })
+  if (!res.ok) throw new Error(`Slack通知失敗: ${res.status} ${await res.text()}`)
+  // 送信に成功したものだけ通知済みとして記録する（失敗時は次回リトライ）
+  const notifiedAt = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" })
+  await gapi(
+    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(`'${NOTIFIED_TAB}'!A1`)}:append?valueInputOption=RAW`,
+    "POST",
+    { values: fresh.map((t) => [t.ticketCode, date, t.time, t.quantity, t.nickname, notifiedAt]) },
+  )
+  console.log(`当日券通知: ${fresh.length}件（${fresh.map((t) => t.ticketCode).join(", ")}）`)
 }
 
 async function writeTab(spreadsheetId, tab, clearRange, values) {
@@ -313,8 +377,11 @@ const fmtDate = (date) => `${date.slice(5)}(${WEEKDAYS[new Date(date + "T00:00:0
 
 async function sync(targetKey, detailDates) {
   const spreadsheetId = await ensureSpreadsheet(targetKey)
-  const { detail, all } = await buildData(TARGETS[targetKey].events, detailDates)
+  const { detail, all, sameDay } = await buildData(TARGETS[targetKey].events, detailDates)
   const now = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" })
+  if (TARGETS[targetKey].notifySameDay) {
+    await notifySameDayPurchases(spreadsheetId, TARGETS[targetKey].notifySameDay, detailDates[0], sameDay)
+  }
   // タブ順: 日付 / 日付 時間別 … / 時間別 全日程
   let tabIndex = 0
   for (const date of detailDates) {
