@@ -414,6 +414,15 @@ function receptionPersonRows(tickets, startIdx) {
 
 const RC_CELL_FIELDS = "userEnteredValue,userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
 
+// 行の高さ（元の受付表と同じ: タイトル34/日付21/ヘッダー30/データ行47）
+const rcRowHeight = (sheetId, startIndex, endIndex, pixelSize) => ({
+  updateDimensionProperties: {
+    range: { sheetId, dimension: "ROWS", startIndex, endIndex },
+    properties: { pixelSize },
+    fields: "pixelSize",
+  },
+})
+
 // 表全体（A1〜F最終行）に実線の格子罫線を引く（元の受付表と同じ見た目）
 const RC_BORDER = { style: "SOLID", color: { red: 0, green: 0, blue: 0 } }
 const receptionBorderRequest = (sheetId, endRowIndex) => ({
@@ -500,6 +509,10 @@ async function upsertReceptionTabs(reception, slotTickets, appendDates) {
         },
         ...receptionRowRequests(sheetId, 3, c.tickets),
         receptionBorderRequest(sheetId, 3 + c.tickets.reduce((s, t) => s + t.quantity, 0)),
+        rcRowHeight(sheetId, 0, 1, 34),
+        rcRowHeight(sheetId, 1, 2, 21),
+        rcRowHeight(sheetId, 2, 3, 30),
+        rcRowHeight(sheetId, 3, 3 + c.tickets.reduce((s, t) => s + t.quantity, 0), 47),
       )
     })
     await gapi(`https://sheets.googleapis.com/v4/spreadsheets/${id}:batchUpdate`, "POST", { requests })
@@ -525,9 +538,8 @@ async function upsertReceptionTabs(reception, slotTickets, appendDates) {
       const startIdx = rows.length // 0始まり = 最終使用行の次
       const requests = receptionRowRequests(sheetId, startIdx, fresh)
       if (requests.length) {
-        requests.push(
-          receptionBorderRequest(sheetId, startIdx + fresh.reduce((s, t) => s + t.quantity, 0)),
-        )
+        const endIdx = startIdx + fresh.reduce((s, t) => s + t.quantity, 0)
+        requests.push(receptionBorderRequest(sheetId, endIdx), rcRowHeight(sheetId, startIdx, endIdx, 47))
         await gapi(`https://sheets.googleapis.com/v4/spreadsheets/${id}:batchUpdate`, "POST", { requests })
         console.log(`受付表に追記: ${title} ${fresh.length}件（${fresh.map((t) => t.ticketCode).join(", ")}）`)
       }
