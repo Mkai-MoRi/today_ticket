@@ -11,8 +11,11 @@ export default async function handler(req, res) {
   if (!secret || (auth !== `Bearer ${secret}` && adminKey !== secret)) {
     return res.status(401).json({ error: "unauthorized" })
   }
+  // SYNC_TARGETS（カンマ区切り）で対象を絞れる。公演期間外のターゲットを止める用。
+  const enabled = (process.env.SYNC_TARGETS || "").split(",").map((s) => s.trim()).filter(Boolean)
+  const keys = enabled.length ? targetKeys.filter((k) => enabled.includes(k)) : targetKeys
   const results = {}
-  for (const key of targetKeys) {
+  for (const key of keys) {
     try {
       await syncTarget(key)
       results[key] = "ok"
